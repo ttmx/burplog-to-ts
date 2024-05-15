@@ -1,0 +1,10 @@
+{
+	"eslint.lintTask.enable": true,
+	"eslint.format.enable": true,
+	"editor.defaultFormatter": "dbaeumer.vscode-eslint",
+	"editor.codeActionsOnSave": {
+		"source.fixAll.eslint": "explicit"
+	},
+	"editor.tabSize": 2,
+	"eslint.experimental.useFlatConfig": true,
+}
