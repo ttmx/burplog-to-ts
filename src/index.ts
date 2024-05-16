@@ -74,6 +74,7 @@ function nameFrom(method:Method,path:string){
 
 
 
+let specialTypes = ''
 const jsonInput = jsonInputForTargetLanguage('typescript');
 for (const [path, methods] of reqsPerPath.entries()) {
 	for (const [method, reqs] of methods.entries()) {
@@ -81,42 +82,74 @@ for (const [path, methods] of reqsPerPath.entries()) {
 		const requestHeaders = stringifiedReqs.map(req => req.split('\r\n\r\n')[0])
 		const requestBodies = stringifiedReqs.map(req => req.split('\r\n\r\n')[1])
 		const needsBearer = requestHeaders.some(header => header.includes('Authorization: Bearer'))
-		try{
 
+		if (requestBodies.every(body => body === '[]')){
+			specialTypes += `export type ${nameFrom(method,path)}Request = any[]\n`
+		}
+		let hasRequestBody = false
+		try{
 			await jsonInput.addSource({
 				name: `${nameFrom(method,path)}Request`,
 				samples: requestBodies
 			});
+			hasRequestBody = true
 		}catch(e){ /* empty */ }
+
 
 
 		const stringifiedRes = reqs.map(req => Buffer.from(req.response,'base64').toString('utf-8'))
 		// const responseHeaders = stringifiedReqs.map(req => req.split('\r\n\r\n')[0])
 		const responseBodies = stringifiedRes.map(req => req.split('\r\n\r\n')[1])
+		if (responseBodies.every(body => body === '[]')){
+			specialTypes += `export type ${nameFrom(method,path)}Response = any[]\n`
+		}
+		let hasResponseBody = false
 		try{
 			await jsonInput.addSource({
 				name: `${nameFrom(method,path)}Response`,
 				samples: responseBodies
 			});
+			hasResponseBody = true
 		}catch(e){ /* empty */ }
+		if (`${nameFrom(method,path)}Response` === 'GetApiV2UserClubsCodesResponse'){
+			const jsonInput = jsonInputForTargetLanguage('typescript');
+			await jsonInput.addSource({
+				name: 'kappachungus',
+				samples: responseBodies
+			});
+			const input = new InputData();
+			input.addInput(jsonInput);
+			const errorType =  await quicktype({
+				inputData: input,
+				lang: 'typescript',
+				combineClasses: false,
+				rendererOptions:{
+					'just-types':true,
+					'prefer-types':true,
+					'acronym-style':'original',
+				},
+			})
+		}
+
 
 		generatedUrls.push({
 			path,
 			method,
 			needsBearer,
-			hasRequestBody:requestBodies.some(body => body.length > 0),
-			hasResponseBody:responseBodies.some(body => body.length > 0)
+			hasRequestBody,
+			hasResponseBody
 		})
 
 	}
 }
 
-let outputString = '/* eslint-disable @typescript-eslint/no-explicit-any */\n'
+let outputString = '/* eslint-disable @typescript-eslint/no-explicit-any */\n' + specialTypes
 const input = new InputData();
 input.addInput(jsonInput);
 const allTypes =  await quicktype({
 	inputData: input,
 	lang: 'typescript',
+	combineClasses: false,
 	rendererOptions:{
 		'just-types':true,
 		'prefer-types':true,
@@ -127,9 +160,10 @@ outputString += allTypes.lines.join('\n')
 
 for (const {path, method, needsBearer,hasRequestBody,hasResponseBody} of generatedUrls) {
 	const output = `
-	export async function ${method.toLowerCase()}${path.replace(/\//g,'_').replace(/\./g,'_').replace(/-/g,'_')}(
-	   ${hasRequestBody?`request:${nameFrom(method,path)}Request,\n`:''}${needsBearer?'token:string':''}
-	){
+	export async function ${method.toLowerCase()}${path.replace(/\//g,'_').replace(/\./g,'_').replace(/-/g,'_')}(\n`+
+	`${hasRequestBody?`request:${nameFrom(method,path)}Request,\n`:''}`+
+	`${needsBearer?'token:string\n':''}`+
+	`)${hasResponseBody?`:Promise<${nameFrom(method,path)}Response>`:''}{
 		${hasResponseBody?'const response = ':''}await fetch('${path}',{
 			method:'${method}',
 			headers:{
@@ -137,7 +171,7 @@ for (const {path, method, needsBearer,hasRequestBody,hasResponseBody} of generat
 				'Content-Type':'application/json'
 			},
 			body: ${hasRequestBody?'JSON.stringify(request)':'undefined'}
-		})${hasResponseBody?'\nreturn await response.json()':''}
+		})${hasResponseBody?`\nreturn response.json() as Promise<${nameFrom(method,path)}Response>`:''}
 	}
 	`
 	outputString += output
