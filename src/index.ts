@@ -1,5 +1,6 @@
 import { XMLParser } from 'fast-xml-parser';
 import Bun from 'bun';
+import {parseArgs} from 'util'
 import {
 	quicktype,
 	InputData,
@@ -7,20 +8,43 @@ import {
 } from 'quicktype-core';
 
 
-const burpLog = Bun.file('burplog.xml')
-const host = Bun.argv[2]
+const { values, _ } = parseArgs({
+	args: Bun.argv,
+	options: {
+		host: {
+			short: 'h',
+			type: 'string',
+		},
+		input:{
+			short:'i',
+			type:'string',
+			default:'burplog.xml',
+		}
+	},
+	allowPositionals: true,
+})
+console.error(values)
+const burpLog = Bun.file(values.input as string)
+const host = values.host as string
 
 const parser = new XMLParser();
 const xmlObj = parser.parse(await burpLog.text())
 
 // console.log(xmlObj.items.item[0])
 
+let commonPrefix = null
 const reqsPerPath = new Map<string, Map<Method,BurpItem[]>>()
 for (let i = 0; i < xmlObj.items.item.length; i++) {
 	const req = xmlObj.items.item[i] as BurpItem;
     
 	if (req.host === host) {
 		const path = req.path.split('?')[0]
+		if (commonPrefix === null) {
+			commonPrefix = path
+		}else{
+			const prefixLength = commonPrefix.split('').reduce((acc,cur,i) => cur === path[i] ? acc+1 : acc,0)
+			commonPrefix = commonPrefix.slice(0,prefixLength)
+		}
 		const method = req.method
 		let pathMap = reqsPerPath.get(path)
 		if(!pathMap){
@@ -65,7 +89,7 @@ const generatedUrls: {
 
 function nameFrom(method:Method,path:string){
 	// Make letter after / uppercase
-	path = method.toLowerCase()+'/'+path
+	path = method.toLowerCase()+'/'+path.substring(commonPrefix.length)
 	const parts = path.split('/')
 	const name = parts.map(part => part.charAt(0).toUpperCase() + part.slice(1)).join('')
 	return name
@@ -111,25 +135,6 @@ for (const [path, methods] of reqsPerPath.entries()) {
 			});
 			hasResponseBody = true
 		}catch(e){ /* empty */ }
-		if (`${nameFrom(method,path)}Response` === 'GetApiV2UserClubsCodesResponse'){
-			const jsonInput = jsonInputForTargetLanguage('typescript');
-			await jsonInput.addSource({
-				name: 'kappachungus',
-				samples: responseBodies
-			});
-			const input = new InputData();
-			input.addInput(jsonInput);
-			const errorType =  await quicktype({
-				inputData: input,
-				lang: 'typescript',
-				combineClasses: false,
-				rendererOptions:{
-					'just-types':true,
-					'prefer-types':true,
-					'acronym-style':'original',
-				},
-			})
-		}
 
 
 		generatedUrls.push({
@@ -143,7 +148,7 @@ for (const [path, methods] of reqsPerPath.entries()) {
 	}
 }
 
-let outputString = '/* eslint-disable @typescript-eslint/no-explicit-any */\n' + specialTypes
+let outputString = '/* eslint-disable @typescript-eslint/no-explicit-any */\n' + specialTypes + `\n const baseUrl = 'https://${host}'\n`
 const input = new InputData();
 input.addInput(jsonInput);
 const allTypes =  await quicktype({
@@ -164,7 +169,7 @@ for (const {path, method, needsBearer,hasRequestBody,hasResponseBody} of generat
 	`${hasRequestBody?`request:${nameFrom(method,path)}Request,\n`:''}`+
 	`${needsBearer?'token:string\n':''}`+
 	`)${hasResponseBody?`:Promise<${nameFrom(method,path)}Response>`:''}{
-		${hasResponseBody?'const response = ':''}await fetch('${path}',{
+		${hasResponseBody?'const response = ':''}await fetch(\`\${baseUrl}${path}\`,{
 			method:'${method}',
 			headers:{
 				${needsBearer?'\'Authorization\':\'Bearer \' + token,':''}
