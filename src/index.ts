@@ -4,45 +4,46 @@ import {
 	quicktype,
 	InputData,
 	jsonInputForTargetLanguage,
-	JSONSchemaInput,
-	FetchingJSONSchemaStore,
-	TargetLanguage,
-	TypeScriptTargetLanguage
 } from 'quicktype-core';
 
 
 const burpLog = Bun.file('burplog.xml')
+const host = Bun.argv[2]
 
 const parser = new XMLParser();
 const xmlObj = parser.parse(await burpLog.text())
 
 // console.log(xmlObj.items.item[0])
 
-const reqsPerPath = new Map<string, BurpItem[]>()
+const reqsPerPath = new Map<string, Map<Method,BurpItem[]>>()
 for (let i = 0; i < xmlObj.items.item.length; i++) {
 	const req = xmlObj.items.item[i] as BurpItem;
     
-	if (req.host === 'redacted' && req.mimetype === 'JSON') {
-		reqsPerPath.set(req.method + ' '+req.path, reqsPerPath.get(req.method + ' ' +req.path) ? reqsPerPath.get(req.method + ' ' +req.path)!.concat(req) : [req])
-		// console.log(req.request)
-		const rawRequest = Buffer.from(req.request, 'base64').toString('utf-8')
-		const rawResponse = Buffer.from(req.response, 'base64').toString('utf-8')
-		const requestBody = rawRequest.split('\r\n\r\n')[1]
-		const responseBody = rawResponse.split('\r\n\r\n')[1]
-        
-		// console.log(req.url)
-		// console.log(">>> "+request)
-		// console.log("<<< "+response)
+	if (req.host === host) {
+		const path = req.path.split('?')[0]
+		const method = req.method
+		let pathMap = reqsPerPath.get(path)
+		if(!pathMap){
+			pathMap = new Map()
+			reqsPerPath.set(path,pathMap)
+		}
+		let methodList = pathMap.get(method)
+		if(!methodList){
+			methodList = []
+			pathMap.set(method,methodList)
+		}
+		methodList.push(req)
 	}
 }
 
+type Method = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'OPTIONS' | 'HEAD' | 'TRACE' | 'CONNECT'
 interface BurpItem {
 	time: string;
 	url: string;
 	host: string;
 	port: number;
 	protocol: string;
-	method: string;
+	method: Method;
 	path: string;
 	extension: string | null;
 	request: string;
@@ -53,42 +54,92 @@ interface BurpItem {
 	comment: string;
 }
 
-async function quicktypeJSON(typeName:string, samples:string[]) {
-	const jsonInput = jsonInputForTargetLanguage('typescript');
 
-	// We could add multiple samples for the same desired
-	// type, or many sources for other types. Here we're
-	// just making one type from one piece of sample JSON.
-	await jsonInput.addSource({
-		name: typeName,
-		samples: samples
-	});
+const generatedUrls: {
+	path: string,
+	method: Method,
+	needsBearer:boolean,
+	hasRequestBody:boolean,
+	hasResponseBody:boolean
+}[] = [];
 
-	const inputData = new InputData();
-	inputData.addInput(jsonInput);
-
-	return await quicktype({
-		inputData,
-		lang: new TypeScriptTargetLanguage(),
-		indentation: '\t',
-		rendererOptions:{
-			'just-types':true,
-			'prefer-types':true
-		},
-
-	});
+function nameFrom(method:Method,path:string){
+	// Make letter after / uppercase
+	path = method.toLowerCase()+'/'+path
+	const parts = path.split('/')
+	const name = parts.map(part => part.charAt(0).toUpperCase() + part.slice(1)).join('')
+	return name
 }
-for (const [path, reqs] of reqsPerPath.entries()) {
-	console.log(path)
-	const samples = reqs.map(req => Buffer.from(req.response,'base64').toString('utf-8').split('\r\n\r\n')[1])
-	const typeName = path.split('/')[1]
-	try {
-		const { lines } = await quicktypeJSON(typeName, samples)
-		console.log(lines.join('\n'))
-	}catch(e){
-		console.log(samples)
-		console.error(e)
+
+
+
+
+const jsonInput = jsonInputForTargetLanguage('typescript');
+for (const [path, methods] of reqsPerPath.entries()) {
+	for (const [method, reqs] of methods.entries()) {
+		const stringifiedReqs = reqs.map(req => Buffer.from(req.request,'base64').toString('utf-8'))
+		const requestHeaders = stringifiedReqs.map(req => req.split('\r\n\r\n')[0])
+		const requestBodies = stringifiedReqs.map(req => req.split('\r\n\r\n')[1])
+		const needsBearer = requestHeaders.some(header => header.includes('Authorization: Bearer'))
+		try{
+
+			await jsonInput.addSource({
+				name: `${nameFrom(method,path)}Request`,
+				samples: requestBodies
+			});
+		}catch(e){ /* empty */ }
+
+
+		const stringifiedRes = reqs.map(req => Buffer.from(req.response,'base64').toString('utf-8'))
+		// const responseHeaders = stringifiedReqs.map(req => req.split('\r\n\r\n')[0])
+		const responseBodies = stringifiedRes.map(req => req.split('\r\n\r\n')[1])
+		try{
+			await jsonInput.addSource({
+				name: `${nameFrom(method,path)}Response`,
+				samples: responseBodies
+			});
+		}catch(e){ /* empty */ }
+
+		generatedUrls.push({
+			path,
+			method,
+			needsBearer,
+			hasRequestBody:requestBodies.some(body => body.length > 0),
+			hasResponseBody:responseBodies.some(body => body.length > 0)
+		})
+
 	}
-	// const { lines } = await quicktypeJSON(typeName, samples)
-	console.log('--------------------------------------------------')
 }
+
+let outputString = '/* eslint-disable @typescript-eslint/no-explicit-any */\n'
+const input = new InputData();
+input.addInput(jsonInput);
+const allTypes =  await quicktype({
+	inputData: input,
+	lang: 'typescript',
+	rendererOptions:{
+		'just-types':true,
+		'prefer-types':true,
+		'acronym-style':'original',
+	},
+})
+outputString += allTypes.lines.join('\n')
+
+for (const {path, method, needsBearer,hasRequestBody,hasResponseBody} of generatedUrls) {
+	const output = `
+	export async function ${method.toLowerCase()}${path.replace(/\//g,'_').replace(/\./g,'_').replace(/-/g,'_')}(
+	   ${hasRequestBody?`request:${nameFrom(method,path)}Request,\n`:''}${needsBearer?'token:string':''}
+	){
+		${hasResponseBody?'const response = ':''}await fetch('${path}',{
+			method:'${method}',
+			headers:{
+				${needsBearer?'\'Authorization\':\'Bearer \' + token,':''}
+				'Content-Type':'application/json'
+			},
+			body: ${hasRequestBody?'JSON.stringify(request)':'undefined'}
+		})${hasResponseBody?'\nreturn await response.json()':''}
+	}
+	`
+	outputString += output
+}
+console.log(outputString)
